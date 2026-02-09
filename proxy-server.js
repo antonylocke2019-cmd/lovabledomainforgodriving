@@ -6,10 +6,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const LOVABLE_URL = process.env.LOVABLE_URL || 'https://godrivingapp.com';
 
-// Cache the main HTML page
 let cachedHTML = null;
 let cacheTime = 0;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const CACHE_DURATION = 5 * 60 * 1000;
 
 async function fetchMainHTML() {
   const now = Date.now();
@@ -19,7 +18,7 @@ async function fetchMainHTML() {
 
   try {
     console.log('[FETCH] Getting fresh HTML from godrivingapp.com...');
-    const response = await fetch('https://godrivingapp.com/instructors/login', {
+    const response = await fetch('https://godrivingapp.com/', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -41,7 +40,6 @@ async function fetchMainHTML() {
   return cachedHTML;
 }
 
-// Pre-fetch on startup
 fetchMainHTML();
 
 // Hostname detection API
@@ -62,7 +60,69 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Proxy static assets (JS, CSS, images) directly to Lovable's CDN
+// ============================================
+// PROXY ROUTES - Must be BEFORE the catch-all
+// ============================================
+
+// Lovable OAuth routes (Google/Apple sign-in)
+app.use('/~oauth', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  followRedirects: false,
+  onProxyReq: (proxyReq, req) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    proxyReq.setHeader('Referer', 'https://godrivingapp.com/');
+    console.log(`[OAUTH] ${req.method} ${req.url}`);
+  },
+  onProxyRes: (proxyRes, req) => {
+    const originalHost = req.headers.host || '';
+    // Rewrite OAuth redirect URLs to stay on subdomain
+    if (proxyRes.headers.location) {
+      const originalLocation = proxyRes.headers.location;
+      let newLocation = originalLocation;
+
+      // Keep Google OAuth redirects as-is (they go to Google)
+      // But rewrite any godrivingapp.com callbacks to subdomain
+      if (originalHost.includes('.godrivingapp.com') && 
+          !newLocation.includes('accounts.google.com') &&
+          !newLocation.includes('appleid.apple.com')) {
+        newLocation = newLocation.replace(
+          /https?:\/\/godrivingapp\.com/g,
+          `https://${originalHost}`
+        );
+      }
+
+      if (newLocation !== originalLocation) {
+        proxyRes.headers.location = newLocation;
+        console.log(`[OAUTH REDIRECT] ${originalLocation} -> ${newLocation}`);
+      }
+    }
+  }
+}));
+
+// Lovable internal API routes
+app.use('/~api', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+// Analytics script
+app.use('/~flock.js', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+// Static assets (JS, CSS, images)
 app.use('/assets', createProxyMiddleware({
   target: 'https://godrivingapp.com',
   changeOrigin: true,
@@ -74,7 +134,7 @@ app.use('/assets', createProxyMiddleware({
   }
 }));
 
-// Proxy Supabase/API calls
+// Supabase/REST API calls
 app.use('/rest', createProxyMiddleware({
   target: 'https://godrivingapp.com',
   changeOrigin: true,
@@ -84,50 +144,48 @@ app.use('/rest', createProxyMiddleware({
   }
 }));
 
-// Proxy auth callbacks
+// Auth callback routes
 app.use('/auth', createProxyMiddleware({
   target: 'https://godrivingapp.com',
   changeOrigin: true,
   secure: true,
   onProxyReq: (proxyReq) => {
     proxyReq.setHeader('Host', 'godrivingapp.com');
+  },
+  onProxyRes: (proxyRes, req) => {
+    const originalHost = req.headers.host || '';
+    if (proxyRes.headers.location) {
+      const originalLocation = proxyRes.headers.location;
+      let newLocation = originalLocation;
+      if (originalHost.includes('.godrivingapp.com')) {
+        newLocation = newLocation.replace(
+          /https?:\/\/godrivingapp\.com/g,
+          `https://${originalHost}`
+        );
+      }
+      if (newLocation !== originalLocation) {
+        proxyRes.headers.location = newLocation;
+        console.log(`[AUTH REDIRECT] ${originalLocation} -> ${newLocation}`);
+      }
+    }
   }
 }));
 
-// Proxy the analytics script
-app.use('/~flock.js', createProxyMiddleware({
-  target: 'https://godrivingapp.com',
-  changeOrigin: true,
-  secure: true,
-  onProxyReq: (proxyReq) => {
-    proxyReq.setHeader('Host', 'godrivingapp.com');
-  }
-}));
-
-app.use('/~api', createProxyMiddleware({
-  target: 'https://godrivingapp.com',
-  changeOrigin: true,
-  secure: true,
-  onProxyReq: (proxyReq) => {
-    proxyReq.setHeader('Host', 'godrivingapp.com');
-  }
-}));
-
-// Serve favicon
+// Favicon
 app.get('/favicon.png', async (req, res) => {
   try {
     const response = await fetch('https://godrivingapp.com/favicon.png');
-    const buffer = await response.buffer();
+    const buffer = await response.arrayBuffer();
     res.set('Content-Type', 'image/png');
-    res.send(buffer);
+    res.send(Buffer.from(buffer));
   } catch (err) {
     res.status(404).send('Not found');
   }
 });
 
-// ALL page routes - serve the cached HTML
-// This is a Single Page App, so all routes serve the same HTML
-// The React router handles the actual routing client-side
+// ============================================
+// CATCH-ALL: Serve cached HTML for all pages
+// ============================================
 app.get('*', async (req, res) => {
   const host = req.headers.host || '';
   const subdomain = extractSubdomain(host);
@@ -140,7 +198,6 @@ app.get('*', async (req, res) => {
     return res.status(503).send('Service temporarily unavailable. Please try again.');
   }
 
-  // Inject subdomain info into the HTML so the React app can detect it
   const injectedHTML = html.replace(
     '</head>',
     `<meta name="x-subdomain" content="${subdomain || ''}" />
@@ -167,5 +224,6 @@ function extractSubdomain(hostname) {
 app.listen(PORT, () => {
   console.log(`Proxy running on ${PORT}`);
   console.log(`Serving app from: godrivingapp.com`);
+  console.log(`OAuth proxy: /~oauth -> godrivingapp.com`);
   console.log(`Hostname API: /api/hostname`);
 });
