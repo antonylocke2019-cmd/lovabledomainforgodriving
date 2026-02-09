@@ -6,12 +6,9 @@ const PORT = process.env.PORT || 3001;
 const LOVABLE_URL = process.env.LOVABLE_URL;
 
 if (!LOVABLE_URL) {
-  console.error('❌ LOVABLE_URL environment variable is required');
+  console.error('LOVABLE_URL required');
   process.exit(1);
 }
-
-console.log(`🔄 Starting proxy server...`);
-console.log(`📡 Target: ${LOVABLE_URL}`);
 
 app.use('/', createProxyMiddleware({
   target: LOVABLE_URL,
@@ -27,6 +24,5 @@ app.use('/', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => {
-  console.log(`✅ Proxy running on port ${PORT}`);
-  console.log(`📡 Forwarding to: ${LOVABLE_URL}`);
+  console.log(`Proxy running on ${PORT} -> ${LOVABLE_URL}`);
 });
