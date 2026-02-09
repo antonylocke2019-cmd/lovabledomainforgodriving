@@ -1,19 +1,50 @@
 import express from 'express';
+import fetch from 'node-fetch';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const LOVABLE_URL = process.env.LOVABLE_URL;
+const LOVABLE_URL = process.env.LOVABLE_URL || 'https://godrivingapp.com';
 
-if (!LOVABLE_URL) {
-  console.error('LOVABLE_URL required');
-  process.exit(1);
+// Cache the main HTML page
+let cachedHTML = null;
+let cacheTime = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+async function fetchMainHTML() {
+  const now = Date.now();
+  if (cachedHTML && (now - cacheTime) < CACHE_DURATION) {
+    return cachedHTML;
+  }
+
+  try {
+    console.log('[FETCH] Getting fresh HTML from godrivingapp.com...');
+    const response = await fetch('https://godrivingapp.com/instructors/login', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      redirect: 'follow'
+    });
+
+    if (response.ok) {
+      cachedHTML = await response.text();
+      cacheTime = now;
+      console.log('[FETCH] HTML cached successfully');
+    } else {
+      console.error(`[FETCH] Failed: ${response.status}`);
+    }
+  } catch (err) {
+    console.error('[FETCH] Error:', err.message);
+  }
+
+  return cachedHTML;
 }
 
-// We need to resolve Lovable's actual server IP
-// by using the lovable.app domain as both target AND host
-const lovableHostname = new URL(LOVABLE_URL).hostname;
+// Pre-fetch on startup
+fetchMainHTML();
 
+// Hostname detection API
 app.get('/api/hostname', (req, res) => {
   const originalHost = req.headers.host || '';
   res.json({
@@ -22,69 +53,106 @@ app.get('/api/hostname', (req, res) => {
   });
 });
 
+// Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', proxy: LOVABLE_URL, timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    cached: !!cachedHTML,
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.use('/', createProxyMiddleware({
-  target: LOVABLE_URL,
+// Proxy static assets (JS, CSS, images) directly to Lovable's CDN
+app.use('/assets', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
   changeOrigin: true,
-  ws: true,
   secure: true,
-  onProxyReq: (proxyReq, req) => {
-    const originalHost = req.headers.host || '';
-
-    // Use Lovable's own domain as Host header
-    // CloudFront should accept this since it's the origin domain
-    proxyReq.setHeader('Host', lovableHostname);
-    proxyReq.setHeader('X-Original-Host', originalHost);
-    proxyReq.setHeader('X-Forwarded-Host', originalHost);
-    proxyReq.setHeader('X-Forwarded-Proto', 'https');
-
-    // Remove headers that trigger CDN blocking
-    proxyReq.removeHeader('x-forwarded-for');
-    proxyReq.removeHeader('cf-connecting-ip');
-    proxyReq.removeHeader('cf-ray');
-    proxyReq.removeHeader('cf-visitor');
-    proxyReq.removeHeader('cf-ipcountry');
-
-    // Add a proper User-Agent so CDN doesn't block as bot
-    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (compatible; GoDrivingProxy/1.0)');
-    proxyReq.setHeader('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
-
-    console.log(`[PROXY] ${originalHost}${req.url} -> ${lovableHostname}${req.url}`);
-  },
-  onProxyRes: (proxyRes, req, res) => {
-    const originalHost = req.headers.host || '';
-    if (proxyRes.headers.location) {
-      const originalLocation = proxyRes.headers.location;
-      let newLocation = originalLocation;
-
-      // Rewrite any redirects to stay on original subdomain
-      if (originalHost.includes('.godrivingapp.com')) {
-        newLocation = newLocation.replace(/https?:\/\/godrivingapp\.com/g, `https://${originalHost}`);
-      }
-      newLocation = newLocation.replace(
-        new RegExp(`https?://${lovableHostname.replace('.', '\\.')}`, 'g'),
-        `https://${originalHost}`
-      );
-
-      if (newLocation !== originalLocation) {
-        proxyRes.headers.location = newLocation;
-        console.log(`[REDIRECT REWRITE] ${originalLocation} -> ${newLocation}`);
-      }
-    }
-  },
-  onError: (err, req, res) => {
-    console.error(`[PROXY ERROR] ${req.headers.host}${req.url}:`, err.message);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: 'Unable to reach the application server',
-      host: req.headers.host,
-      url: req.url
-    });
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    proxyReq.setHeader('Referer', 'https://godrivingapp.com/');
   }
 }));
+
+// Proxy Supabase/API calls
+app.use('/rest', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+// Proxy auth callbacks
+app.use('/auth', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+// Proxy the analytics script
+app.use('/~flock.js', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+app.use('/~api', createProxyMiddleware({
+  target: 'https://godrivingapp.com',
+  changeOrigin: true,
+  secure: true,
+  onProxyReq: (proxyReq) => {
+    proxyReq.setHeader('Host', 'godrivingapp.com');
+  }
+}));
+
+// Serve favicon
+app.get('/favicon.png', async (req, res) => {
+  try {
+    const response = await fetch('https://godrivingapp.com/favicon.png');
+    const buffer = await response.buffer();
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);
+  } catch (err) {
+    res.status(404).send('Not found');
+  }
+});
+
+// ALL page routes - serve the cached HTML
+// This is a Single Page App, so all routes serve the same HTML
+// The React router handles the actual routing client-side
+app.get('*', async (req, res) => {
+  const host = req.headers.host || '';
+  const subdomain = extractSubdomain(host);
+
+  console.log(`[PAGE] ${host}${req.url} (subdomain: ${subdomain})`);
+
+  const html = await fetchMainHTML();
+
+  if (!html) {
+    return res.status(503).send('Service temporarily unavailable. Please try again.');
+  }
+
+  // Inject subdomain info into the HTML so the React app can detect it
+  const injectedHTML = html.replace(
+    '</head>',
+    `<meta name="x-subdomain" content="${subdomain || ''}" />
+    <meta name="x-original-host" content="${host}" />
+    <script>window.__SUBDOMAIN__="${subdomain || ''}";window.__ORIGINAL_HOST__="${host}";</script>
+    </head>`
+  );
+
+  res.set('Content-Type', 'text/html');
+  res.set('Cache-Control', 'no-cache');
+  res.send(injectedHTML);
+});
 
 function extractSubdomain(hostname) {
   if (!hostname) return null;
@@ -97,7 +165,7 @@ function extractSubdomain(hostname) {
 }
 
 app.listen(PORT, () => {
-  console.log(`Proxy running on ${PORT} -> ${LOVABLE_URL}`);
-  console.log(`Host header: ${lovableHostname}`);
-  console.log(`Hostname API available at /api/hostname`);
+  console.log(`Proxy running on ${PORT}`);
+  console.log(`Serving app from: godrivingapp.com`);
+  console.log(`Hostname API: /api/hostname`);
 });
