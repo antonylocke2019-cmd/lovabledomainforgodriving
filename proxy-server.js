@@ -10,7 +10,9 @@ if (!LOVABLE_URL) {
   process.exit(1);
 }
 
-const PROXY_HOST = 'godrivingapp.com';
+// We need to resolve Lovable's actual server IP
+// by using the lovable.app domain as both target AND host
+const lovableHostname = new URL(LOVABLE_URL).hostname;
 
 app.get('/api/hostname', (req, res) => {
   const originalHost = req.headers.host || '';
@@ -31,22 +33,42 @@ app.use('/', createProxyMiddleware({
   secure: true,
   onProxyReq: (proxyReq, req) => {
     const originalHost = req.headers.host || '';
-    proxyReq.setHeader('Host', PROXY_HOST);
+
+    // Use Lovable's own domain as Host header
+    // CloudFront should accept this since it's the origin domain
+    proxyReq.setHeader('Host', lovableHostname);
     proxyReq.setHeader('X-Original-Host', originalHost);
     proxyReq.setHeader('X-Forwarded-Host', originalHost);
     proxyReq.setHeader('X-Forwarded-Proto', 'https');
+
+    // Remove headers that trigger CDN blocking
     proxyReq.removeHeader('x-forwarded-for');
-    console.log(`[PROXY] ${originalHost}${req.url} -> ${PROXY_HOST}${req.url}`);
+    proxyReq.removeHeader('cf-connecting-ip');
+    proxyReq.removeHeader('cf-ray');
+    proxyReq.removeHeader('cf-visitor');
+    proxyReq.removeHeader('cf-ipcountry');
+
+    // Add a proper User-Agent so CDN doesn't block as bot
+    proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (compatible; GoDrivingProxy/1.0)');
+    proxyReq.setHeader('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
+
+    console.log(`[PROXY] ${originalHost}${req.url} -> ${lovableHostname}${req.url}`);
   },
   onProxyRes: (proxyRes, req, res) => {
     const originalHost = req.headers.host || '';
     if (proxyRes.headers.location) {
       const originalLocation = proxyRes.headers.location;
       let newLocation = originalLocation;
+
+      // Rewrite any redirects to stay on original subdomain
       if (originalHost.includes('.godrivingapp.com')) {
         newLocation = newLocation.replace(/https?:\/\/godrivingapp\.com/g, `https://${originalHost}`);
       }
-      newLocation = newLocation.replace(/https?:\/\/pdf-peek-project\.lovable\.app/g, `https://${originalHost}`);
+      newLocation = newLocation.replace(
+        new RegExp(`https?://${lovableHostname.replace('.', '\\.')}`, 'g'),
+        `https://${originalHost}`
+      );
+
       if (newLocation !== originalLocation) {
         proxyRes.headers.location = newLocation;
         console.log(`[REDIRECT REWRITE] ${originalLocation} -> ${newLocation}`);
@@ -76,6 +98,6 @@ function extractSubdomain(hostname) {
 
 app.listen(PORT, () => {
   console.log(`Proxy running on ${PORT} -> ${LOVABLE_URL}`);
-  console.log(`Host header set to: ${PROXY_HOST}`);
+  console.log(`Host header: ${lovableHostname}`);
   console.log(`Hostname API available at /api/hostname`);
 });
